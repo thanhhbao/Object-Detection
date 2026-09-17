@@ -34,6 +34,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "eval"))
 
 from tune_conf_thresholds import CLASS_NAMES, resolve_split  # noqa: E402
 

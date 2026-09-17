@@ -20,6 +20,29 @@ from utils.visualize import draw_detections, pil_to_bgr, bgr_to_pil, CLASSES
 
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
 
+# COCO-80 class indices → our 6-class indices (None = skip).
+# Used when a COCO-pretrained model (80 classes) is loaded in the demo.
+_COCO_TO_6: dict[int, int] = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4, 7: 5}
+
+
+def _is_coco_model(model) -> bool:
+    """Return True if the model was trained on COCO-80 (not our 6-class task)."""
+    try:
+        return len(model.names) == 80
+    except Exception:
+        return False
+
+
+def _remap_coco_boxes(boxes: list[tuple]) -> list[tuple]:
+    """Filter COCO-80 boxes to our 6 classes and remap class IDs."""
+    out = []
+    for cls_id, conf, x1, y1, x2, y2 in boxes:
+        mapped = _COCO_TO_6.get(cls_id)
+        if mapped is not None:
+            out.append((mapped, conf, x1, y1, x2, y2))
+    return out
+
+
 MODEL_PATH_ENV = "MODEL_PATH"
 GDRIVE_ID_SECRET = "model_gdrive_id"
 _DEMO_ROOT = Path(__file__).parent.parent
@@ -71,6 +94,13 @@ def _download_weights() -> Path:
     return cached
 
 
+def _best_device() -> str:
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 @st.cache_resource(show_spinner=False)
 def load_model(weights_path: str | None = None):
     """Load a YOLO model, cached per path so multiple checkpoints can coexist.
@@ -96,6 +126,9 @@ def load_model(weights_path: str | None = None):
     return model
 
 
+_DEVICE = _best_device()
+
+
 def detect_image_boxes(
     model,
     image: Image.Image,
@@ -109,8 +142,12 @@ def detect_image_boxes(
     Returns (elapsed_ms, boxes) where each box is (cls_id, conf, x1, y1, x2, y2).
     """
     img_bgr = pil_to_bgr(image)
+    is_coco = _is_coco_model(model)
+    # For COCO models, run without class filter (we remap manually after)
+    coco_classes = None if is_coco else classes
     t0 = time.perf_counter()
-    results = model.predict(img_bgr, conf=conf_floor, iou=iou, classes=classes, verbose=False)
+    results = model.predict(img_bgr, conf=conf_floor, iou=iou, classes=coco_classes,
+                            device="cpu", verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     result = results[0]
     boxes: list[tuple] = []
@@ -120,6 +157,8 @@ def detect_image_boxes(
                 int(box.cls[0]), float(box.conf[0]),
                 *[float(v) for v in box.xyxy[0].tolist()],
             ))
+    if is_coco:
+        boxes = _remap_coco_boxes(boxes)
     return elapsed_ms, boxes
 
 
@@ -143,6 +182,7 @@ def predict_image(
         conf=conf,
         iou=iou,
         classes=classes,
+        device="cpu",
         verbose=False,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -172,8 +212,20 @@ def predict_image(
 
 
 def _is_direct_video_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return path.endswith(VIDEO_EXTENSIONS)
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith(VIDEO_EXTENSIONS):
+        return True
+    # Pexels CDN and similar hosts serve video without explicit extension
+    direct_hosts = ("videos.pexels.com", "cdn.pixabay.com", "player.vimeo.com/external")
+    if any(h in parsed.netloc for h in direct_hosts):
+        return True
+    return False
+
+
+def _ffmpeg_available() -> bool:
+    import shutil
+    return shutil.which("ffmpeg") is not None
 
 
 def download_video_from_url(url: str, max_mb: int = 200) -> str:
@@ -216,15 +268,24 @@ def download_video_from_url(url: str, max_mb: int = 200) -> str:
         ) from exc
 
     out_path = tempfile.mktemp(suffix=".mp4")
+    cookies_file = next(
+        (p for p in (_DEMO_ROOT / "assets").glob("*cookies*.txt") if p.exists()),
+        _DEMO_ROOT / "assets" / "youtube_cookies.txt",
+    )
     ydl_opts = {
         "format": "mp4[height<=720]/best[height<=720]/best",
         "outtmpl": out_path,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        # Use exported cookies file to bypass YouTube bot check (no keychain needed).
+        **({"cookiefile": str(cookies_file)} if cookies_file.exists() else {}),
     }
+    # Partial download (first 2 min) requires ffmpeg — only add if available.
+    if _ffmpeg_available():
+        ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(0, 120)])
+        ydl_opts["force_keyframes_at_cuts"] = True
     # Enable browser impersonation to bypass Cloudflare anti-bot (needs curl_cffi).
-    # Pick the first available target rather than a hardcoded one.
     try:
         with yt_dlp.YoutubeDL({"quiet": True}) as probe:
             targets = probe._get_available_impersonate_targets()
@@ -255,6 +316,8 @@ def predict_video(
     max_frames: int = 300,
 ) -> Generator[tuple[np.ndarray, list[dict]], None, None]:
     """Yield (annotated_frame_bgr, detections) for each frame."""
+    is_coco = _is_coco_model(model)
+    predict_classes = None if is_coco else classes
     cap = cv2.VideoCapture(video_path)
     total = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), max_frames)
     frame_idx = 0
@@ -264,7 +327,8 @@ def predict_video(
         if not ret:
             break
 
-        results = model.predict(frame, conf=conf, iou=iou, classes=classes, verbose=False)
+        results = model.predict(frame, conf=conf, iou=iou, classes=predict_classes,
+                                device="cpu", verbose=False)
         result = results[0]
         boxes_raw = []
         detections = []
@@ -274,9 +338,14 @@ def predict_video(
                 cls_id = int(box.cls[0])
                 conf_val = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
+                if is_coco:
+                    mapped = _COCO_TO_6.get(cls_id)
+                    if mapped is None:
+                        continue
+                    cls_id = mapped
                 boxes_raw.append((cls_id, conf_val, x1, y1, x2, y2))
                 detections.append({
-                    "class": CLASSES[cls_id] if cls_id < len(CLASSES) else str(cls_id),
+                    "class": CLASSES[cls_id],
                     "confidence": round(conf_val, 3),
                 })
 

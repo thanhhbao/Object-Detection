@@ -1,0 +1,28 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_vast.yaml
+
+# Ablation: RT-DETR-L + weather augmentation ngoại tuyến
+# Biến thay đổi so với phase2_final: dữ liệu (thêm ~2.100 ảnh tăng cường)
+# Mọi thứ khác giữ nguyên: cùng kiến trúc RT-DETR-L, cùng LR, cùng checkpoint nguồn.
+#
+# BƯỚC 1 — Tạo dataset augmentation (chạy 1 lần):
+#   python scripts/data_prep/augmentation/augment_weather.py \
+#       --src /workspace/datasets_noleak/phase2_merged \
+#       --dst /workspace/datasets_noleak/phase2_merged_waug \
+#       --bdd-ratio 0.70 --xwod-ratio 0.12 --acdc-ratio 0.0 \
+#       --seed 42 --clean
+#
+# BƯỚC 2 — Chạy train:
+#   python scripts/train/train_ultralytics.py \
+#       --config configs/ablation/phase2_rtdetr_weather_aug.yaml \
+#       --data /workspace/datasets_noleak/phase2_merged_waug/dataset.yaml
+
+from_run: phase2_final_rtdetr
+dataset: phase2_merged
+name: ablation_rtdetr_weather_aug
+
+epochs: 20
+patience: 10
+lr0: 0.00001
+lrf: 0.01
+seed: 42

@@ -40,26 +40,40 @@ st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 CLASS_LABELS = [c.capitalize() for c in CLASSES]
 
-# Multiple checkpoints can live in demo/runs — pick one from the toolbar to test.
 MODELS = list_local_models()
-if MODELS:
-    _default = next((n for n in MODELS if "v3_960" in n or "phase2_v3" in n), list(MODELS)[0])
-    st.session_state.setdefault("model_choice", _default)
-    if st.session_state["model_choice"] not in MODELS:
-        st.session_state["model_choice"] = _default
-    model = load_model(MODELS[st.session_state["model_choice"]])
-    # Switching model clears stale detection results
-    if st.session_state.get("_last_model") != st.session_state["model_choice"]:
-        st.session_state.pop("img_result", None)
-        st.session_state.pop("vid_result", None)
-        st.session_state["_last_model"] = st.session_state["model_choice"]
-else:
-    model = load_model()
+_model_names = list(MODELS)
+_NO_MODEL = "— Không —"
+
+
+def _pick(tokens: tuple[str, ...], fallback: str) -> str:
+    for n in _model_names:
+        if all(t in n.lower() for t in tokens):
+            return n
+    return fallback
+
+
+def _model_label(name: str) -> str:
+    lo = name.lower()
+    if "a0r" in lo or "rare" in lo:
+        return "RT-DETR-L A0R"
+    if ("rtdetr" in lo or "rt_detr" in lo or "rt-detr" in lo) and ("coco" in lo or "baseline" in lo):
+        return "RT-DETR-L COCO Baseline"
+    if "rtdetr" in lo or "rt_detr" in lo or "rt-detr" in lo:
+        return "RT-DETR-L Phase 2"
+    if "coco" in lo and "baseline" in lo:
+        return "YOLOv8n COCO Baseline"
+    if "v3_960" in lo or "phase2" in lo:
+        return "YOLOv8n Phase 2"
+    if "v1" in lo or "stage1" in lo:
+        return "YOLOv8n Stage 1"
+    return name.replace("_", " ")
 
 # ── Session init ──────────────────────────────────────────────────────────────
 st.session_state.setdefault("recents", [])       # list of {name, kind, bytes, meta}
 st.session_state.setdefault("active_name", None)
 st.session_state.setdefault("last_upload", None)
+st.session_state.setdefault("stop_requested", False)
+st.session_state.setdefault("is_running", False)
 
 
 def upsert_recent(name: str, kind: str, data: bytes, meta: str) -> None:
@@ -96,14 +110,14 @@ def object_rows(items: list[dict]) -> str:
 #  TOOLBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.container(border=True):
-    tb_brand, tb_mode, tb_actions = st.columns([3, 3, 4], vertical_alignment="center")
+    tb_brand, tb_mode, tb_actions = st.columns([2.2, 1.5, 6.3], vertical_alignment="center")
     with tb_brand:
         st.markdown("""
         <div class="brand">
             <div class="brand-logo">◉</div>
             <div>
                 <div class="brand-title">Aperture</div>
-                <div class="brand-sub">Object detection platform</div>
+                <div class="brand-sub">Adverse Weather · KLTN NTT</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -112,14 +126,30 @@ with st.container(border=True):
                                     label_visibility="collapsed")
         mode = mode or "Image"
     with tb_actions:
-        a1, a2 = st.columns([3, 2], vertical_alignment="center")
+        a1, a2, a3 = st.columns([3.2, 3.2, 1.6], vertical_alignment="center")
         with a1:
-            if MODELS:
-                st.selectbox("Model", list(MODELS), key="model_choice", label_visibility="collapsed")
-            else:
-                st.selectbox("Model", ["auto (best.pt)"], label_visibility="collapsed", disabled=True)
+            baseline_name = st.selectbox(
+                "Baseline", _model_names,
+                index=_model_names.index(_pick(("coco", "baseline"), _model_names[0])),
+                format_func=_model_label, label_visibility="collapsed",
+            )
         with a2:
-            run = st.button("Run detection", key="run_btn")
+            _final_opts = [_NO_MODEL] + _model_names
+            final_name = st.selectbox(
+                "Final", _final_opts,
+                index=_final_opts.index(_pick(("v3_960",), _model_names[-1])) if _pick(("v3_960",), _model_names[-1]) in _final_opts else 0,
+                format_func=lambda n: "Không (1 model)" if n == _NO_MODEL else _model_label(n),
+                label_visibility="collapsed",
+            )
+        with a3:
+            if st.session_state.get("is_running"):
+                stop_btn = st.button("Stop", key="stop_btn", use_container_width=True)
+                if stop_btn:
+                    st.session_state["stop_requested"] = True
+                run = False
+            else:
+                run = st.button("Run detection", key="run_btn", use_container_width=True)
+                st.session_state["stop_requested"] = False
 
 KIND = "image" if mode == "Image" else "video"
 
@@ -177,7 +207,7 @@ with left:
 
         # Import video from URL
         if KIND == "video":
-            with st.form("url_form", clear_on_submit=False):
+            with st.form("url_form", clear_on_submit=True):
                 url = st.text_input("Video URL",
                                     placeholder="https://…/clip.mp4 or a YouTube link",
                                     label_visibility="collapsed")
@@ -233,63 +263,85 @@ with left:
 
 active = get_active()
 
-# ── Run detection (image is fast — done here; video is processed in the center) ──
+# ── Run detection ─────────────────────────────────────────────────────────────
+_single_mode = (final_name == _NO_MODEL)
+
 if run and active and active["kind"] == "image":
     img = Image.open(io.BytesIO(active["bytes"])).convert("RGB")
-    elapsed, boxes = detect_image_boxes(model, img, iou=iou, classes=None)
+    prog = st.progress(0, text="Running…")
+    base_ms, base_boxes = detect_image_boxes(load_model(MODELS[baseline_name]), img, iou=iou)
+    if _single_mode:
+        final_ms, final_boxes = None, None
+    else:
+        prog.progress(50, text="Running Final model…")
+        final_ms, final_boxes = detect_image_boxes(load_model(MODELS[final_name]), img, iou=iou)
+    prog.progress(100, text="Done")
+    prog.empty()
     st.session_state["img_result"] = {
-        "name": active["name"], "boxes": boxes, "elapsed": elapsed,
+        "name": active["name"],
+        "baseline_boxes": base_boxes, "baseline_ms": base_ms,
+        "final_boxes": final_boxes, "final_ms": final_ms,
+        "baseline_name": baseline_name, "final_name": final_name,
         "w": img.width, "h": img.height,
     }
     st.session_state["scroll_to_results"] = True
 
-# Video processing runs inside the center column (progress shows under the video)
 do_video_run = bool(run and active and active["kind"] == "video")
+if do_video_run:
+    st.session_state["is_running"] = True
 
 # ── Build current results ─────────────────────────────────────────────────────
-summary = None          # {avg, total, n_classes, time_ms, counts, confidences}
-obj_items: list[dict] = []
-image_dets: list[dict] = []
+base_summary = final_summary = None
+base_annotated = final_annotated = None
+obj_items: list[dict] = []   # kept for video compat in bottom section
 
 img_res = st.session_state.get("img_result")
 vid_res = st.session_state.get("vid_result")
 
-if KIND == "image" and active and img_res and img_res["name"] == active["name"]:
-    boxes = [b for b in img_res["boxes"] if b[1] >= conf and b[0] in sel_set]
-    img = Image.open(io.BytesIO(active["bytes"])).convert("RGB")
-    annotated = bgr_to_pil(draw_detections(pil_to_bgr(img), boxes, conf_threshold=0))
-    dets = [{"class": CLASSES[b[0]], "confidence": round(b[1], 3),
-             "width": int(b[4] - b[2]), "height": int(b[5] - b[3])} for b in boxes]
-    counts = Counter(d["class"] for d in dets)
-    confs = [d["confidence"] for d in dets]
-    summary = {
-        "avg": (sum(confs) / len(confs)) if confs else 0.0,
-        "total": len(dets), "n_classes": len(counts),
-        "time_ms": img_res["elapsed"], "counts": dict(counts), "confidences": confs,
+
+def _img_summary(boxes: list, elapsed_ms: float) -> dict:
+    counts = Counter(CLASSES[b[0]] for b in boxes)
+    confs = [b[1] for b in boxes]
+    return {
+        "avg": sum(confs) / len(confs) if confs else 0.0,
+        "total": len(boxes), "n_classes": len(counts),
+        "time_ms": elapsed_ms, "counts": dict(counts), "confidences": confs,
     }
-    image_dets = dets   # sorted + turned into obj_items inside the right column
+
+
+if KIND == "image" and active and img_res and img_res["name"] == active["name"]:
+    src_img = Image.open(io.BytesIO(active["bytes"])).convert("RGB")
+    base_boxes = [b for b in img_res["baseline_boxes"] if b[1] >= conf and b[0] in sel_set]
+    base_annotated = bgr_to_pil(draw_detections(pil_to_bgr(src_img), base_boxes, conf_threshold=0))
+    base_summary = _img_summary(base_boxes, img_res["baseline_ms"])
+    if img_res.get("final_boxes") is not None:
+        final_boxes = [b for b in img_res["final_boxes"] if b[1] >= conf and b[0] in sel_set]
+        final_annotated = bgr_to_pil(draw_detections(pil_to_bgr(src_img), final_boxes, conf_threshold=0))
+        final_summary = _img_summary(final_boxes, img_res["final_ms"])
+    else:
+        final_boxes = []
+        final_annotated = None
+        final_summary = None
 
 elif KIND == "video" and active and vid_res and vid_res["name"] == active["name"]:
-    stats = vid_res["stats"]
-    summary = {
-        "avg": stats["conf_mean"], "total": stats["total_detections"],
-        "n_classes": len(stats["class_counts"]), "time_ms": stats["elapsed_s"] * 1000,
-        "counts": stats["class_counts"], "confidences": stats.get("confidences", []),
-    }
-    total = stats["total_detections"] or 1
-    for cls, cnt in sorted(stats["class_counts"].items(), key=lambda x: -x[1]):
-        if cls not in CLASSES:
-            continue
-        obj_items.append({"label": cls.capitalize(), "right": str(cnt),
-                          "pct": int(100 * cnt / total),
-                          "color": CLASS_COLORS_HEX[CLASSES.index(cls)]})
+    def _vid_s(stats: dict) -> dict:
+        return {
+            "avg": stats["conf_mean"], "total": stats["total_detections"],
+            "n_classes": len(stats["class_counts"]), "time_ms": stats["elapsed_s"] * 1000,
+            "counts": stats["class_counts"], "confidences": stats.get("confidences", []),
+        }
+    base_summary = _vid_s(vid_res["baseline_stats"])
+    final_summary = _vid_s(vid_res["final_stats"])
 
-# ── CENTER: preview ───────────────────────────────────────────────────────────
+# summary alias used by the bottom section
+summary = final_summary
+
+# ── CENTER: side-by-side preview ─────────────────────────────────────────────
 with center:
     with st.container(border=True):
         st.markdown(f"""
         <div class="canvas-head">
-            <div class="canvas-status">{"Static image mode" if KIND == "image" else "Video mode"}</div>
+            <div class="canvas-status">{"Static image mode" if KIND == "image" else "Video mode"} · comparison</div>
             <div class="canvas-zoom">{active["name"] if active else "no source"}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -303,65 +355,105 @@ with center:
             </div>
             """, unsafe_allow_html=True)
         elif KIND == "image":
-            if img_res and img_res["name"] == active["name"]:
-                st.image(resize_for_display(annotated), use_container_width=True)
+            bl = _model_label(img_res["baseline_name"]) if img_res else _model_label(baseline_name)
+            res_single = img_res and img_res.get("final_boxes") is None
+            if res_single or _single_mode and not img_res:
+                # single model — full width
+                st.markdown(f'<div class="cmp-label"><span class="dot" style="background:#64748b"></span><span class="name">MODEL</span> · {bl}</div>', unsafe_allow_html=True)
+                disp = base_annotated or Image.open(io.BytesIO(active["bytes"])).convert("RGB")
+                st.image(resize_for_display(disp, 900), use_container_width=True)
             else:
-                st.image(resize_for_display(Image.open(io.BytesIO(active["bytes"])).convert("RGB")),
-                         use_container_width=True)
+                fl = _model_label(img_res["final_name"]) if img_res else _model_label(final_name)
+                col_b, col_f = st.columns(2, gap="small")
+                with col_b:
+                    st.markdown(f'<div class="cmp-label"><span class="dot" style="background:#64748b"></span><span class="name">BASELINE</span> · {bl}</div>', unsafe_allow_html=True)
+                    if base_annotated:
+                        st.image(resize_for_display(base_annotated, 600), use_container_width=True)
+                    else:
+                        st.image(resize_for_display(Image.open(io.BytesIO(active["bytes"])).convert("RGB"), 600),
+                                 use_container_width=True)
+                with col_f:
+                    st.markdown(f'<div class="cmp-label"><span class="dot" style="background:#0ea5e9"></span><span class="name">FINAL</span> · {fl}</div>', unsafe_allow_html=True)
+                    if final_annotated:
+                        st.image(resize_for_display(final_annotated, 600), use_container_width=True)
+                    else:
+                        st.image(resize_for_display(Image.open(io.BytesIO(active["bytes"])).convert("RGB"), 600),
+                                 use_container_width=True)
         else:  # video
             if do_video_run:
-                # Show the source while processing; progress bar sits right under it.
                 st.video(active["bytes"])
-                prog = st.progress(0, text="Processing frames...")
+                prog = st.progress(0, text="Baseline · processing…")
 
-                def _cb(idx, total):
-                    prog.progress(min(idx / max(total, 1), 1.0), text=f"Frame {idx+1} / {total}")
+                def _cb_b(idx, total):
+                    prog.progress(min(0.45 * (idx + 1) / max(total, 1), 0.45),
+                                  text=f"Baseline · frame {idx+1}/{total}")
 
                 tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
                 tmp.write(active["bytes"]); tmp.flush()
-                out_path, stats = process_video_to_file(
-                    model, tmp.name, conf=conf, iou=iou,
+                base_path, base_stats = process_video_to_file(
+                    load_model(MODELS[baseline_name]), tmp.name, conf=conf, iou=iou,
                     classes=(list(sel_set) if len(sel_set) < len(CLASSES) else None),
-                    max_seconds=max_seconds, progress_callback=_cb,
+                    max_seconds=max_seconds, progress_callback=_cb_b,
+                )
+                if st.session_state.get("stop_requested"):
+                    prog.empty()
+                    st.session_state["is_running"] = False
+                    st.session_state["stop_requested"] = False
+                    st.warning("Đã dừng sau Baseline.")
+                    st.stop()
+
+                prog.progress(50, text="Final model · processing…")
+
+                def _cb_f(idx, total):
+                    prog.progress(min(0.5 + 0.5 * (idx + 1) / max(total, 1), 1.0),
+                                  text=f"Final model · frame {idx+1}/{total}")
+
+                final_path, final_stats = process_video_to_file(
+                    load_model(MODELS[final_name]), tmp.name, conf=conf, iou=iou,
+                    classes=(list(sel_set) if len(sel_set) < len(CLASSES) else None),
+                    max_seconds=max_seconds, progress_callback=_cb_f,
                 )
                 os.remove(tmp.name)
-                with open(out_path, "rb") as f:
-                    vbytes = f.read()
-                os.remove(out_path)
+                with open(base_path, "rb") as f:
+                    base_vid = f.read()
+                with open(final_path, "rb") as f:
+                    final_vid = f.read()
+                os.remove(base_path); os.remove(final_path)
+                prog.empty()
                 st.session_state["vid_result"] = {
-                    "name": active["name"], "bytes": vbytes, "stats": stats,
+                    "name": active["name"],
+                    "baseline_bytes": base_vid, "baseline_stats": base_stats,
+                    "baseline_name": baseline_name,
+                    "final_bytes": final_vid, "final_stats": final_stats,
+                    "final_name": final_name,
                 }
                 st.session_state["scroll_to_results"] = True
+                st.session_state["is_running"] = False
                 st.rerun()
             elif vid_res and vid_res["name"] == active["name"]:
-                st.video(vid_res["bytes"])
+                col_b, col_f = st.columns(2, gap="small")
+                with col_b:
+                    st.markdown(f'<div class="cmp-label"><span class="dot" style="background:#64748b"></span><span class="name">BASELINE</span> · {_model_label(vid_res["baseline_name"])}</div>', unsafe_allow_html=True)
+                    st.video(vid_res["baseline_bytes"])
+                with col_f:
+                    st.markdown(f'<div class="cmp-label"><span class="dot" style="background:#0ea5e9"></span><span class="name">FINAL</span> · {_model_label(vid_res["final_name"])}</div>', unsafe_allow_html=True)
+                    st.video(vid_res["final_bytes"])
             else:
                 st.video(active["bytes"])
 
-# ── RIGHT: detected objects ───────────────────────────────────────────────────
+# ── RIGHT: comparison table ───────────────────────────────────────────────────
 with right:
     with st.container(border=True):
-        n = summary["total"] if summary else 0
-        st.markdown(f'<div class="panel-label">Detected objects '
-                    f'<span class="count">{n}</span></div>', unsafe_allow_html=True)
+        has_base = base_summary is not None
+        has_both = has_base and final_summary is not None
+        n_base = base_summary["total"] if base_summary else 0
+        n_final = final_summary["total"] if final_summary else 0
+        label = "Kết quả" if not has_both else "Comparison"
+        count_txt = str(n_base) if not has_both else f"{n_base} → {n_final}"
+        st.markdown(f'<div class="panel-label">{label} <span class="count">{count_txt}</span></div>',
+                    unsafe_allow_html=True)
 
-        if KIND == "image":
-            order = st.segmented_control(
-                "sort", ["Confidence", "Type"],
-                default="Confidence", label_visibility="collapsed") or "Confidence"
-            dets_sorted = sorted(
-                image_dets,
-                key=(lambda d: -d["confidence"]) if order == "Confidence" else (lambda d: d["class"]),
-            )
-            obj_items = [{"label": d["class"].capitalize(),
-                          "right": f"{int(d['confidence']*100)}%",
-                          "pct": int(d["confidence"] * 100),
-                          "color": CLASS_COLORS_HEX[CLASSES.index(d["class"])]}
-                         for d in dets_sorted]
-
-        if obj_items:
-            st.markdown(object_rows(obj_items), unsafe_allow_html=True)
-        else:
+        if not has_base:
             st.markdown("""
             <div class="empty-state">
                 <div class="empty-state-icon">◎</div>
@@ -369,110 +461,128 @@ with right:
                 <div class="empty-state-hint">Click "Run detection" to analyze this file</div>
             </div>
             """, unsafe_allow_html=True)
+        elif not has_both:
+            # single model
+            rows = [{"Lớp": c.capitalize(), "Số lượng": int(base_summary["counts"].get(c, 0))}
+                    for c in CLASSES]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                         column_config={
+                             "Lớp": st.column_config.TextColumn("Lớp"),
+                             "Số lượng": st.column_config.NumberColumn("Số lượng", format="%d"),
+                         })
+            st.markdown(
+                f'<div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">'
+                f'Confidence TB: {base_summary["avg"]*100:.0f}% · '
+                f'Thời gian: {base_summary["time_ms"]:.0f} ms</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            delta = n_final - n_base
+            sign = f"+{delta}" if delta > 0 else str(delta)
+            st.markdown(
+                f'<div style="font-size:0.75rem;color:var(--muted);margin-bottom:0.6rem;">'
+                f'Baseline <b>{n_base}</b> → Final <b>{n_final}</b> &nbsp;'
+                f'<span style="color:{"#22c55e" if delta>=0 else "#ef4444"};font-weight:700;">{sign}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            rows = [
+                {"Lớp": c.capitalize(),
+                 "Base": int(base_summary["counts"].get(c, 0)),
+                 "Final": int(final_summary["counts"].get(c, 0)),
+                 "Δ": int(final_summary["counts"].get(c, 0)) - int(base_summary["counts"].get(c, 0))}
+                for c in CLASSES
+            ]
+            st.dataframe(
+                pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                column_config={
+                    "Lớp": st.column_config.TextColumn("Lớp"),
+                    "Base": st.column_config.NumberColumn("Base", format="%d"),
+                    "Final": st.column_config.NumberColumn("Final", format="%d"),
+                    "Δ": st.column_config.NumberColumn("Δ", format="%+d"),
+                },
+            )
+            st.markdown(
+                f'<div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">'
+                f'Thời gian: Base {base_summary["time_ms"]:.0f} ms · Final {final_summary["time_ms"]:.0f} ms</div>',
+                unsafe_allow_html=True,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BOTTOM — post-detection analysis (only shown once there are results)
+#  BOTTOM — post-detection analysis (collapsed by default to keep screen clean)
 # ═══════════════════════════════════════════════════════════════════════════════
-if summary:
-    avg = summary["avg"]
-    total = summary["total"]
-    n_classes = summary["n_classes"]
-    time_ms = summary["time_ms"]
+if base_summary and final_summary:
+    avg_b, avg_f = base_summary["avg"], final_summary["avg"]
 
-    st.markdown("<div style='margin-top:0.5rem;'></div>", unsafe_allow_html=True)
-    st.markdown('<span id="results-anchor" class="section-title">Post-detection analysis</span>',
-                unsafe_allow_html=True)
-    st.markdown("<div style='margin-bottom:0.5rem;'></div>", unsafe_allow_html=True)
-
-    mc = st.columns(4)
-    with mc[0]:
-        with st.container(border=True):
-            st.markdown(f"""
-            <div class="donut-card">
-                {donut(int(avg*100))}
-                <div>
-                    <div class="metric-label" style="font-size:0.8rem;color:var(--muted);">Avg confidence</div>
-                    <div style="font-size:1.6rem;font-weight:800;color:var(--ink);">{avg*100:.0f}<span style="font-size:0.9rem;color:var(--muted);">%</span></div>
+    with st.expander("Post-detection analysis", expanded=False):
+        mc = st.columns(4)
+        with mc[0]:
+            with st.container(border=True):
+                avg = (avg_b + avg_f) / 2
+                st.markdown(f"""
+                <div class="donut-card">
+                    {donut(int(avg*100))}
+                    <div>
+                        <div class="metric-label" style="font-size:0.8rem;color:var(--muted);">Avg confidence (both)</div>
+                        <div style="font-size:1.6rem;font-weight:800;color:var(--ink);">{avg*100:.0f}<span style="font-size:0.9rem;color:var(--muted);">%</span></div>
+                    </div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
-    mc[1].metric("Total objects", total)
-    mc[2].metric("Object classes", n_classes)
-    mc[3].metric("Processing time", f"{time_ms:.0f} ms")
+                """, unsafe_allow_html=True)
+        mc[1].metric("Baseline objects", base_summary["total"])
+        mc[2].metric("Final objects", final_summary["total"],
+                     delta=final_summary["total"] - base_summary["total"])
+        mc[3].metric("Processing time", f"B {base_summary['time_ms']:.0f} ms · F {final_summary['time_ms']:.0f} ms")
 
-    st.markdown("<div style='margin-bottom:0.25rem;'></div>", unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3)
-
-    with p1:
-        with st.container(border=True):
-            st.markdown('<div class="panel-label">Distribution by class</div>', unsafe_allow_html=True)
-            if summary["counts"]:
-                df = pd.DataFrame(
-                    {"count": list(summary["counts"].values())},
-                    index=[c.capitalize() for c in summary["counts"].keys()],
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            with st.container(border=True):
+                st.markdown('<div class="panel-label">Distribution by class</div>', unsafe_allow_html=True)
+                chart_df = pd.DataFrame(
+                    {"Baseline": [base_summary["counts"].get(c, 0) for c in CLASSES],
+                     "Final":    [final_summary["counts"].get(c, 0) for c in CLASSES]},
+                    index=[c.capitalize() for c in CLASSES],
                 )
-                st.bar_chart(df, height=200, color="#374151")
-            else:
-                st.caption("No detections.")
+                st.bar_chart(chart_df, height=180)
 
-    with p2:
-        with st.container(border=True):
-            st.markdown('<div class="panel-label">Confidence chart</div>', unsafe_allow_html=True)
-            confs = summary["confidences"]
-            if confs:
-                counts, edges = np.histogram(confs, bins=10, range=(0.0, 1.0))
-                hist = pd.DataFrame({"count": counts},
-                                    index=[f"{edges[i]:.1f}" for i in range(len(counts))])
-                st.bar_chart(hist, height=200, color="#9ca3af")
-            else:
-                st.caption("No detections.")
+        with p2:
+            with st.container(border=True):
+                st.markdown('<div class="panel-label">Confidence distribution</div>', unsafe_allow_html=True)
+                bc, edges = np.histogram(base_summary["confidences"], bins=10, range=(0.0, 1.0))
+                fc, _ = np.histogram(final_summary["confidences"], bins=10, range=(0.0, 1.0))
+                if bc.sum() or fc.sum():
+                    hist = pd.DataFrame({"Baseline": bc, "Final": fc},
+                                        index=[f"{edges[i]:.1f}" for i in range(len(bc))])
+                    st.bar_chart(hist, height=180)
+                else:
+                    st.caption("No detections.")
 
-    with p3:
-        with st.container(border=True):
-            st.markdown('<div class="panel-label">Notes</div>', unsafe_allow_html=True)
-            st.markdown("""
-            <div class="notes">
-                Drag the confidence threshold on the left to filter out low-certainty
-                detections — useful for checking false positives before exporting a report.
-                The detector is trained for adverse weather (fog, rain, snow, night).
-            </div>
-            """, unsafe_allow_html=True)
+        with p3:
+            with st.container(border=True):
+                st.markdown('<div class="panel-label">Export</div>', unsafe_allow_html=True)
+                export_df = pd.DataFrame([
+                    {"class": c.capitalize(),
+                     "baseline": base_summary["counts"].get(c, 0),
+                     "final": final_summary["counts"].get(c, 0),
+                     "delta": final_summary["counts"].get(c, 0) - base_summary["counts"].get(c, 0)}
+                    for c in CLASSES
+                ])
+                st.download_button("Export CSV", export_df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="baseline_vs_final.csv", mime="text/csv", use_container_width=True)
+                report = (
+                    f"Aperture comparison report\nSource: {active['name'] if active else '-'}\n\n"
+                    f"Baseline: {base_summary['total']} objects, {avg_b*100:.1f}% avg conf\n"
+                    f"Final:    {final_summary['total']} objects, {avg_f*100:.1f}% avg conf\n\n"
+                    "Per class:\n" +
+                    "\n".join(f"  {c}: Base={base_summary['counts'].get(c,0)} Final={final_summary['counts'].get(c,0)}" for c in CLASSES)
+                )
+                st.download_button("Export report", report.encode(),
+                                   file_name="report.txt", mime="text/plain", use_container_width=True)
+                st.markdown(
+                    '<div class="notes" style="margin-top:0.5rem;">Δ dương = Final nhiều box hơn. '
+                    'Kết luận định lượng cần mAP50–95 trên test set.</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # ── Export ────────────────────────────────────────────────────────────────
-    st.markdown("<div style='margin-top:0.5rem;'></div>", unsafe_allow_html=True)
-    e1, e2, e3, _ = st.columns([1, 1, 1, 5])
-    if KIND == "image":
-        export_df = pd.DataFrame(
-            [{"class": it["label"], "confidence": it["pct"] / 100} for it in obj_items]
-        )
-    else:
-        export_df = pd.DataFrame(
-            [{"class": c, "count": v} for c, v in summary["counts"].items()]
-        )
-    e1.download_button("Export CSV", export_df.to_csv(index=False).encode(),
-                       file_name="detections.csv", mime="text/csv", use_container_width=True)
-    e2.download_button("Export JSON",
-                       json.dumps({"summary": {k: summary[k] for k in
-                                   ("avg", "total", "n_classes", "time_ms", "counts")}},
-                                  indent=2).encode(),
-                       file_name="detections.json", mime="application/json", use_container_width=True)
-    report = (f"Aperture detection report\n"
-              f"Source: {active['name'] if active else '-'}\n"
-              f"Total objects: {total}\nObject classes: {n_classes}\n"
-              f"Avg confidence: {avg*100:.1f}%\nProcessing time: {time_ms:.0f} ms\n\n"
-              f"Per class:\n" + "\n".join(f"  {c}: {v}" for c, v in summary["counts"].items()))
-    e3.download_button("Export report", report.encode(),
-                       file_name="report.txt", mime="text/plain", use_container_width=True)
-
-    # Auto-scroll to results after a fresh detection
     if st.session_state.pop("scroll_to_results", False):
-        components.html(
-            """
-            <script>
-                const doc = window.parent.document;
-                const el = doc.querySelector('#results-anchor');
-                if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
-            </script>
-            """,
-            height=0,
-        )
+        pass  # no-op: content is now above the fold, no scroll needed

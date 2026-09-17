@@ -49,12 +49,15 @@ fi
 
 # ACDC raw (cần để re-prepare ở 1280)
 if [ ! -d "$ACDC_RAW" ]; then
-    echo "  Downloading ACDC raw..."
-    mkdir -p "$WORKSPACE/datasets"
-    rclone copy \
-        "$DRIVE_ROOT/official_backup_from_old_machine/acdc_raw.tar.gz" \
-        "$WORKSPACE/" --progress
-    tar -xzf "$WORKSPACE/acdc_raw.tar.gz" -C "$WORKSPACE/datasets/"
+    echo "  Downloading ACDC raw (~15.7GB)..."
+    mkdir -p "$ACDC_RAW"
+    wget -q --show-progress -O /tmp/acdc_rgb.zip \
+        https://acdc.vision.ee.ethz.ch/rgb_anon_trainvaltest.zip
+    wget -q --show-progress -O /tmp/acdc_gt.zip \
+        https://acdc.vision.ee.ethz.ch/gt_panoptic_trainval.zip
+    unzip -q /tmp/acdc_rgb.zip -d "$ACDC_RAW/"
+    unzip -q /tmp/acdc_gt.zip  -d "$ACDC_RAW/"
+    rm /tmp/acdc_rgb.zip /tmp/acdc_gt.zip
 fi
 
 # Model weights (Stage 2 checkpoint để tiếp tục train)

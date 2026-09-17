@@ -1,0 +1,11 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+from_run: stage2_xwod_rtdetr_from_bdd30k
+dataset: phase2_merged_1280
+name: phase2_rtdetr_imgsz1280
+
+imgsz: 1280
+batch: 8
+lr0: 0.00005
+patience: 20

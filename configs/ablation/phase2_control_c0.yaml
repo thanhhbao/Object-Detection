@@ -1,0 +1,26 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+# C0: Control run — YOLOv8n chuẩn + Phase 2 v3 gốc
+# Mục đích: tái lập mô hình cuối (final v3 @960) từ cùng checkpoint Stage 2.
+# Kết quả C0 phải xấp xỉ final; nếu lệch nhiều, cần kiểm tra checkpoint/data.
+# E2 và E3 được so sánh với C0, không với final lịch sử.
+#
+# Chạy (trên Vast.ai):
+#   export OD_PATHS=configs/common/paths_vast.yaml
+#   python scripts/train_ultralytics.py \
+#       --config configs/ablation/phase2_control_c0.yaml \
+#       --data /workspace/datasets/phase2_v3/dataset.yaml
+#
+# Checkpoint khởi tạo: stage2_xwod_yolov8n_from_bdd30k/weights/best.pt
+# (đã khai báo trong from_run; train_ultralytics.py tự resolve)
+
+from_run: stage2_xwod_yolov8n_from_bdd30k
+dataset: xwod
+name: ablation_control_c0_960
+
+imgsz: 960
+lr0: 0.00005
+lrf: 0.01
+patience: 20
+seed: 42

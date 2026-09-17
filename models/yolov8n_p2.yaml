@@ -1,0 +1,57 @@
+# YOLOv8n + P2 small-object head  (4 detection scales: P2 P3 P4 P5)
+#
+# Mở rộng từ yolov8n_baseline.yaml bằng cách thêm nhánh phát hiện stride-4.
+# Backbone (layers 0-9) và FPN top-down (layers 10-15) giống hệt baseline —
+# có thể nạp trọng số một phần từ best.pt qua YOLO.load().
+# Nhánh P2 mới (layers 16-20) và PAN đã đánh số lại (layers 21-27) được khởi
+# tạo ngẫu nhiên nên cần đủ số epoch để hội tụ.
+#
+# Thứ tự detect: [P2/4, P3/8, P4/16, P5/32]
+nc: 6
+
+backbone:
+  # stride 2 → P1
+  - [-1, 1, Conv, [16, 3, 2]]          # 0
+  # stride 4 → P2
+  - [-1, 1, Conv, [32, 3, 2]]          # 1
+  - [-1, 1, C2f, [32, true]]            # 2  ← skip-connect P2 (32 ch)
+  # stride 8 → P3
+  - [-1, 1, Conv, [64, 3, 2]]          # 3
+  - [-1, 2, C2f, [64, true]]            # 4  ← skip-connect P3 (64 ch)
+  # stride 16 → P4
+  - [-1, 1, Conv, [128, 3, 2]]         # 5
+  - [-1, 2, C2f, [128, true]]           # 6  ← skip-connect P4 (128 ch)
+  # stride 32 → P5
+  - [-1, 1, Conv, [256, 3, 2]]         # 7
+  - [-1, 1, C2f, [256, true]]           # 8
+  - [-1, 1, SPPF, [256, 5]]             # 9  SPPF out (256 ch)
+
+head:
+  # ── FPN top-down: P5 → P4 → P3 → P2 ─────────────────────────────────
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]   # 10  P5(256) → P4 res
+  - [[-1, 6], 1, Concat, [1]]                  # 11  cat backbone P4 → 384 ch
+  - [-1, 1, C2f, [128]]                         # 12  P4 FPN neck (128 ch)
+
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]   # 13  P4(128) → P3 res
+  - [[-1, 4], 1, Concat, [1]]                  # 14  cat backbone P3 → 192 ch
+  - [-1, 1, C2f, [64]]                          # 15  P3 FPN neck (64 ch)
+
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]   # 16  P3(64) → P2 res  [NEW]
+  - [[-1, 2], 1, Concat, [1]]                  # 17  cat backbone P2 → 96 ch  [NEW]
+  - [-1, 1, C2f, [32]]                          # 18  P2 detect features (32 ch)  [NEW]
+
+  # ── PAN bottom-up: P2 → P3 → P4 → P5 ────────────────────────────────
+  - [-1, 1, Conv, [32, 3, 2]]                  # 19  P2→P3 down  [NEW]
+  - [[-1, 15], 1, Concat, [1]]                 # 20  cat P3 FPN neck → 96 ch  [NEW]
+  - [-1, 1, C2f, [64]]                          # 21  P3 detect features (64 ch)
+
+  - [-1, 1, Conv, [64, 3, 2]]                  # 22  P3→P4 down
+  - [[-1, 12], 1, Concat, [1]]                 # 23  cat P4 FPN neck → 192 ch
+  - [-1, 1, C2f, [128]]                         # 24  P4 detect features (128 ch)
+
+  - [-1, 1, Conv, [128, 3, 2]]                 # 25  P4→P5 down
+  - [[-1, 9], 1, Concat, [1]]                  # 26  cat SPPF → 384 ch
+  - [-1, 1, C2f, [256]]                         # 27  P5 detect features (256 ch)
+
+  # 4 scales: P2/4, P3/8, P4/16, P5/32
+  - [[18, 21, 24, 27], 1, Detect, [nc]]        # 28

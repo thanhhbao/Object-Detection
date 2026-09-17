@@ -21,3 +21,13 @@ runs/*
 docs/thesis/figures/
 demo/.streamlit/secrets.toml
 demo/.venv/
+
+# Secrets and session data — never commit
+*cookies.txt
+*.cookies
+.env
+*_secrets.*
+.claude/settings.local.json
+
+# macOS
+.DS_Store

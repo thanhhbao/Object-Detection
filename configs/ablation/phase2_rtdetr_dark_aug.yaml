@@ -1,0 +1,28 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_vast.yaml
+
+# Ablation: RT-DETR-L + dark augmentation trên BDD replay
+# Biến thay đổi so với phase2_final: thêm ~1.200 ảnh BDD dark (60% × 2.000 ảnh BDD gốc)
+# Mục đích: kiểm tra giả thuyết "thiếu sáng là nút thắt ACDC night"
+#
+# BƯỚC 1 — Tạo dataset dark:
+#   python scripts/data_prep/augmentation/augment_dark.py \
+#       --src /workspace/datasets_noleak/phase2_merged \
+#       --dst /workspace/datasets_noleak/phase2_merged_dark \
+#       --bdd-ratio 0.60 \
+#       --seed 42 --clean
+#
+# BƯỚC 2 — Chạy train:
+#   python scripts/train/train_ultralytics.py \
+#       --config configs/ablation/phase2_rtdetr_dark_aug.yaml \
+#       --data /workspace/datasets_noleak/phase2_merged_dark/dataset.yaml
+
+from_run: phase2_final_rtdetr
+dataset: phase2_merged
+name: ablation_rtdetr_dark_aug
+
+epochs: 20
+patience: 10
+lr0: 0.00001
+lrf: 0.01
+seed: 42
